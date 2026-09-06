@@ -1,0 +1,150 @@
+#!/bin/bash
+find_app() {
+  for f in /usr/share/applications/*.desktop* ~/.local/share/applications/*.desktop*; do
+    name=$(grep -m1 '^Name=' "$f" | cut -d= -f2-)
+    printf '%s\t%s\n' "$name" "$f"
+  done | fzf --filter="$1" --nth=1 --with-nth=1,2 -d '\t' | cut -f2
+}
+sudowrap() {
+  path="$1"
+  shift
+  case "$path" in
+    "$HOME"/.local/*) "$@" ;;
+    *) sudo "$@" ;;
+  esac
+}
+refresh_cache() {
+  command -v update-desktop-database >/dev/null 2>&1 || return 0
+  update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1
+  sudowrap /usr/share/applications update-desktop-database /usr/share/applications >/dev/null 2>&1
+}
+check_deps() {
+  missing=""
+  for dep in fzf gum grep cut mv; do
+    command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"
+  done
+  if [ -n "$missing" ]; then
+    echo "ERROR: missing required dependencies:$missing"
+    exit 1
+  fi
+}
+if [ -z "$1" ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  echo "crowbar: take down a program by it's name in the application menu"
+  echo "usage: crowbar \"program name\""
+  exit 0
+fi
+check_deps
+lines=0
+gum style "Crowbar: $1" --border=double --padding="1 2"
+lines=$((lines + 5))
+matches="$(find_app "$1" | wc -l)"
+if [ "$matches" = 0 ]; then
+  printf '\033[%dF\033[0J' "$lines"
+  echo "ERROR: no program found"
+  exit 1
+elif [ "$matches" = 1 ]; then
+  file="$(find_app "$1")"
+else
+  file="$(find_app "$1" | gum choose)"
+  if [ "$file" = "nothing selected" ] || [ -z "$file" ]; then
+    lines=$((lines + 1))
+    printf '\033[%dF\033[0J' "$lines"
+    echo "ERROR: nothing selected"
+    exit 1
+  fi
+fi
+if [ "${file##*.}" = "desktop" ]; then
+  if [[ "$file" != "$HOME"/.local/* ]] && command -v pacman >/dev/null 2>&1; then
+    type="$(gum choose Disable Uninstall)"
+  else type="Disable"; fi
+else
+  if [[ "$file" != "$HOME"/.local/* ]] && command -v pacman >/dev/null 2>&1; then
+    type="$(gum choose Enable 'Enable and Uninstall' Update)"
+  else type="Enable"; fi
+fi
+if [ "$type" = "nothing selected" ] || [ -z "$type" ]; then
+  lines=$((lines + 1))
+  printf '\033[%dF\033[0J' "$lines"
+  echo "ERROR: nothing selected"
+  exit 1
+elif [ "$type" = Disable ]; then
+  sudowrap "$file" mv "$file" "$file.disabled"
+  refresh_cache
+  printf '\033[%dF\033[0J' "$lines"
+  echo "disabled $1!"
+  exit 0
+elif [ "$type" = Enable ]; then
+  sudowrap "$file" mv "$file" "${file%%.desktop*}.desktop"
+  refresh_cache
+  printf '\033[%dF\033[0J' "$lines"
+  echo "enabled $1!"
+  exit 0
+elif [ "$type" = Uninstall ]; then
+  pkg="$(pacman -Qoq "$file" 2>/dev/null)"
+  if [ -n "$pkg" ]; then
+    echo "uninstalling $1..."
+    sudo pacman -Rns "$pkg" --noconfirm >/dev/null 2>&1
+    status=$?
+    refresh_cache
+    lines=$((lines + 1))
+    printf '\033[%dF\033[0J' "$lines"
+    if [ "$status" -eq 0 ]; then
+      echo "uninstalled $1!"
+    else
+      echo "ERROR: failed to uninstall $1"
+      exit 1
+    fi
+    exit 0
+  else
+    printf '\033[%dF\033[0J' "$lines"
+    echo "ERROR: not managed by pacman"
+    exit 1
+  fi
+elif [ "$type" = Update ]; then
+  enabled="${file%%.desktop*}.desktop"
+  sudowrap "$file" mv "$file" "$enabled"
+  pkg="$(pacman -Qoq "$enabled" 2>/dev/null)"
+  if [ -z "$pkg" ]; then
+    sudowrap "$enabled" mv "$enabled" "$file"
+    printf '\033[%dF\033[0J' "$lines"
+    echo "ERROR: not managed by pacman"
+    exit 1
+  fi
+  echo "updating $1..."
+  sudo pacman -S --needed "$pkg" --noconfirm >/dev/null 2>&1
+  status=$?
+  sudowrap "$enabled" mv "$enabled" "$file"
+  refresh_cache
+  lines=$((lines + 1))
+  printf '\033[%dF\033[0J' "$lines"
+  if [ "$status" -eq 0 ]; then
+    echo "updated $1!"
+  else
+    echo "ERROR: failed to update $1"
+    exit 1
+  fi
+  exit 0
+elif [ "$type" = 'Enable and Uninstall' ]; then
+  enabled="${file%%.desktop*}.desktop"
+  sudowrap "$file" mv "$file" "$enabled"
+  pkg="$(pacman -Qoq "$enabled" 2>/dev/null)"
+  if [ -z "$pkg" ]; then
+    sudowrap "$enabled" mv "$enabled" "$file"
+    printf '\033[%dF\033[0J' "$lines"
+    echo "ERROR: not managed by pacman"
+    exit 1
+  fi
+  echo "uninstalling $1..."
+  sudo pacman -Rns "$pkg" --noconfirm >/dev/null 2>&1
+  status=$?
+  refresh_cache
+  lines=$((lines + 1))
+  printf '\033[%dF\033[0J' "$lines"
+  if [ "$status" -eq 0 ]; then
+    echo "uninstalled $1!"
+  else
+    echo "ERROR: failed to uninstall $1"
+    exit 1
+  fi
+  exit 0
+fi
