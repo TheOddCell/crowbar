@@ -1,6 +1,7 @@
 #!/bin/bash
+shopt -s nullglob
 find_app() {
-  for f in /usr/share/applications/*.desktop* ~/.local/share/applications/*.desktop*; do
+  for f in /usr/share/applications/*.desktop* ~/.local/share/applications/*.desktop* /var/lib/flatpak/exports/share/applications/*.desktop* ~/.local/share/flatpak/exports/share/applications/*.desktop*; do
     name=$(grep -m1 '^Name=' "$f" | cut -d= -f2-)
     printf '%s\t%s\n' "$name" "$f"
   done | fzf --filter="$1" --nth=1 --with-nth=1,2 -d '\t' | cut -f2
@@ -28,6 +29,28 @@ check_deps() {
     exit 1
   fi
 }
+do_uninstall() {
+  case "$managed" in
+    pacman) sudo pacman -Rns "$pkg" --noconfirm >/dev/null 2>&1 ;;
+    flatpak)
+      if [ "$fp_scope" = system ]; then
+        sudo flatpak uninstall --system -y "$pkg" >/dev/null 2>&1
+      else
+        flatpak uninstall --user -y "$pkg" >/dev/null 2>&1
+      fi ;;
+  esac
+}
+do_update() {
+  case "$managed" in
+    pacman) sudo pacman -S --needed "$pkg" --noconfirm >/dev/null 2>&1 ;;
+    flatpak)
+      if [ "$fp_scope" = system ]; then
+        sudo flatpak update --system -y "$pkg" >/dev/null 2>&1
+      else
+        flatpak update --user -y "$pkg" >/dev/null 2>&1
+      fi ;;
+  esac
+}
 if [ -z "$1" ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
   echo "crowbar: take down a program by it's name in the application menu"
   echo "usage: crowbar \"program name\""
@@ -53,67 +76,100 @@ else
     exit 1
   fi
 fi
-if [ "${file##*.}" = "desktop" ]; then
-  if [[ "$file" != "$HOME"/.local/* ]] && command -v pacman >/dev/null 2>&1; then
-    type="$(gum choose Disable Uninstall)"
-  else type="Disable"; fi
-else
-  if [[ "$file" != "$HOME"/.local/* ]] && command -v pacman >/dev/null 2>&1; then
-    type="$(gum choose Enable 'Enable and Uninstall' Update)"
-  else type="Enable"; fi
+
+enabled="${file%%.desktop*}.desktop"
+orig_disabled=0
+[ "$file" != "$enabled" ] && orig_disabled=1
+file_now="$file"
+
+managed=""
+pkg=""
+fp_scope=""
+
+if command -v flatpak >/dev/null 2>&1; then
+  base="$(basename "$enabled" .desktop)"
+  if flatpak info --user "$base" >/dev/null 2>&1; then
+    managed="flatpak"; pkg="$base"; fp_scope="user"
+  elif flatpak info --system "$base" >/dev/null 2>&1; then
+    managed="flatpak"; pkg="$base"; fp_scope="system"
+  fi
 fi
+
+if [ -z "$managed" ] && command -v pacman >/dev/null 2>&1 && [[ "$enabled" != "$HOME"/.local/* ]]; then
+  peeked=0
+  if [ "$file_now" != "$enabled" ]; then
+    sudowrap "$file_now" mv "$file_now" "$enabled"
+    file_now="$enabled"
+    peeked=1
+  fi
+  pkg="$(pacman -Qoq "$enabled" 2>/dev/null)"
+  if [ -n "$pkg" ]; then
+    managed="pacman"
+  elif [ "$peeked" = 1 ]; then
+    sudowrap "$file_now" mv "$file_now" "$file"
+    file_now="$file"
+  fi
+fi
+
+if [ "$orig_disabled" = 1 ]; then
+  if [ -n "$managed" ]; then
+    type="$(gum choose Enable 'Enable and Uninstall' Update)"
+  else
+    type="Enable"
+  fi
+else
+  if [ -n "$managed" ]; then
+    type="$(gum choose Disable Uninstall)"
+  else
+    type="Disable"
+  fi
+fi
+
 if [ "$type" = "nothing selected" ] || [ -z "$type" ]; then
+  if [ "$file_now" != "$file" ]; then
+    sudowrap "$file_now" mv "$file_now" "$file"
+  fi
   lines=$((lines + 1))
   printf '\033[%dF\033[0J' "$lines"
   echo "ERROR: nothing selected"
   exit 1
 elif [ "$type" = Disable ]; then
-  sudowrap "$file" mv "$file" "$file.disabled"
+  sudowrap "$file_now" mv "$file_now" "$file.disabled"
   refresh_cache
   printf '\033[%dF\033[0J' "$lines"
   echo "disabled $1!"
   exit 0
 elif [ "$type" = Enable ]; then
-  sudowrap "$file" mv "$file" "${file%%.desktop*}.desktop"
+  if [ "$file_now" != "$enabled" ]; then
+    sudowrap "$file_now" mv "$file_now" "$enabled"
+  fi
   refresh_cache
   printf '\033[%dF\033[0J' "$lines"
   echo "enabled $1!"
   exit 0
 elif [ "$type" = Uninstall ]; then
-  pkg="$(pacman -Qoq "$file" 2>/dev/null)"
-  if [ -n "$pkg" ]; then
-    echo "uninstalling $1..."
-    sudo pacman -Rns "$pkg" --noconfirm >/dev/null 2>&1
-    status=$?
-    refresh_cache
-    lines=$((lines + 1))
-    printf '\033[%dF\033[0J' "$lines"
-    if [ "$status" -eq 0 ]; then
-      echo "uninstalled $1!"
-    else
-      echo "ERROR: failed to uninstall $1"
-      exit 1
-    fi
-    exit 0
+  echo "uninstalling $1..."
+  do_uninstall
+  status=$?
+  refresh_cache
+  lines=$((lines + 1))
+  printf '\033[%dF\033[0J' "$lines"
+  if [ "$status" -eq 0 ]; then
+    echo "uninstalled $1!"
   else
-    printf '\033[%dF\033[0J' "$lines"
-    echo "ERROR: not managed by pacman"
+    echo "ERROR: failed to uninstall $1"
     exit 1
   fi
+  exit 0
 elif [ "$type" = Update ]; then
-  enabled="${file%%.desktop*}.desktop"
-  sudowrap "$file" mv "$file" "$enabled"
-  pkg="$(pacman -Qoq "$enabled" 2>/dev/null)"
-  if [ -z "$pkg" ]; then
-    sudowrap "$enabled" mv "$enabled" "$file"
-    printf '\033[%dF\033[0J' "$lines"
-    echo "ERROR: not managed by pacman"
-    exit 1
+  if [ "$file_now" != "$enabled" ]; then
+    sudowrap "$file_now" mv "$file_now" "$enabled"
+    file_now="$enabled"
   fi
   echo "updating $1..."
-  sudo pacman -S --needed "$pkg" --noconfirm >/dev/null 2>&1
+  do_update
   status=$?
-  sudowrap "$enabled" mv "$enabled" "$file"
+  sudowrap "$file_now" mv "$file_now" "$file"
   refresh_cache
   lines=$((lines + 1))
   printf '\033[%dF\033[0J' "$lines"
@@ -125,17 +181,12 @@ elif [ "$type" = Update ]; then
   fi
   exit 0
 elif [ "$type" = 'Enable and Uninstall' ]; then
-  enabled="${file%%.desktop*}.desktop"
-  sudowrap "$file" mv "$file" "$enabled"
-  pkg="$(pacman -Qoq "$enabled" 2>/dev/null)"
-  if [ -z "$pkg" ]; then
-    sudowrap "$enabled" mv "$enabled" "$file"
-    printf '\033[%dF\033[0J' "$lines"
-    echo "ERROR: not managed by pacman"
-    exit 1
+  if [ "$file_now" != "$enabled" ]; then
+    sudowrap "$file_now" mv "$file_now" "$enabled"
+    file_now="$enabled"
   fi
   echo "uninstalling $1..."
-  sudo pacman -Rns "$pkg" --noconfirm >/dev/null 2>&1
+  do_uninstall
   status=$?
   refresh_cache
   lines=$((lines + 1))
