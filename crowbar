@@ -1,5 +1,70 @@
 #!/bin/bash
 shopt -s nullglob
+export CLICOLOR_FORCE=1  # keep gum colors on even though emit() captures its output via a pipe
+
+# color palette
+C_TITLE=212   # pink - header box
+C_HEAD=99     # purple - choose headers
+C_CURSOR=212  # pink - choose cursor/selection
+C_INFO=39     # blue - progress/info
+C_STEP=245    # gray - fine-grained step detail
+C_OK=42       # green - success
+C_ERR=196     # red - errors
+C_WARN=214    # orange - warnings
+
+lines=0
+box_lines=0
+
+# print already-styled text and track how many terminal lines it took
+emit() {
+  printf '%s\n' "$1"
+  lines=$((lines + $(printf '%s\n' "$1" | wc -l)))
+}
+
+info()  { emit "$(gum style --foreground "$C_INFO" "$*")"; }
+step()  { emit "$(gum style --foreground "$C_STEP" --italic "$*")"; }
+ok()    { emit "$(gum style --foreground "$C_OK" --bold "$*")"; }
+warn()  { emit "$(gum style --foreground "$C_WARN" "$*")"; }
+err()   { emit "$(gum style --foreground "$C_ERR" --bold "$*")"; }
+
+# erase everything printed below the header box, keeping the box on screen
+clear_to_box() {
+  if [ "$lines" -gt "$box_lines" ]; then
+    printf '\033[%dF\033[0J' "$((lines - box_lines))"
+  fi
+  lines=$box_lines
+}
+
+# erase everything printed so far, including the header box
+clear_all() {
+  if [ "$lines" -gt 0 ]; then
+    printf '\033[%dF\033[0J' "$lines"
+  fi
+  lines=0
+}
+
+finalize_ok() {
+  clear_all
+  ok "$1"
+  exit 0
+}
+finalize_err() {
+  clear_all
+  err "$1"
+  exit 1
+}
+
+choose() {
+  header="$1"
+  shift
+  gum choose "$@" \
+    --header "$header" \
+    --header.foreground "$C_HEAD" \
+    --cursor.foreground "$C_CURSOR" \
+    --selected.foreground "$C_CURSOR" \
+    --cursor "➤ "
+}
+
 find_app() {
   for f in /usr/share/applications/*.desktop* ~/.local/share/applications/*.desktop* /var/lib/flatpak/exports/share/applications/*.desktop* ~/.local/share/flatpak/exports/share/applications/*.desktop*; do
     name=$(grep -m1 '^Name=' "$f" | cut -d= -f2-)
@@ -16,6 +81,7 @@ sudowrap() {
 }
 refresh_cache() {
   command -v update-desktop-database >/dev/null 2>&1 || return 0
+  step "refreshing the desktop application cache..."
   update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1
   sudowrap /usr/share/applications update-desktop-database /usr/share/applications >/dev/null 2>&1
 }
@@ -25,7 +91,7 @@ check_deps() {
     command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"
   done
   if [ -n "$missing" ]; then
-    echo "ERROR: missing required dependencies:$missing"
+    err "ERROR: missing required dependencies:$missing"
     exit 1
   fi
 }
@@ -52,28 +118,33 @@ do_update() {
   esac
 }
 if [ -z "$1" ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-  echo "crowbar: take down a program by it's name in the application menu"
+  gum style --foreground "$C_TITLE" --bold "crowbar"
+  echo "take down a program by its name in the application menu"
+  echo
   echo "usage: crowbar \"program name\""
   exit 0
 fi
 check_deps
-lines=0
-gum style "Crowbar: $1" --border=double --padding="1 2"
-lines=$((lines + 5))
+
+box="$(gum style "Crowbar: $1" --border=double --padding="1 2" --align center \
+  --foreground "$C_TITLE" --border-foreground "$C_TITLE" --bold)"
+printf '%s\n' "$box"
+box_lines=$(printf '%s\n' "$box" | wc -l)
+lines=$box_lines
+
+info "searching for \"$1\"..."
 matches="$(find_app "$1" | wc -l)"
 if [ "$matches" = 0 ]; then
-  printf '\033[%dF\033[0J' "$lines"
-  echo "ERROR: no program found"
-  exit 1
+  finalize_err "ERROR: no program found matching \"$1\""
 elif [ "$matches" = 1 ]; then
   file="$(find_app "$1")"
+  step "found exactly one match: $file"
 else
-  file="$(find_app "$1" | gum choose)"
+  step "found $matches matches for \"$1\""
+  clear_to_box
+  file="$(find_app "$1" | choose "Multiple matches for \"$1\" — pick one:")"
   if [ "$file" = "nothing selected" ] || [ -z "$file" ]; then
-    lines=$((lines + 1))
-    printf '\033[%dF\033[0J' "$lines"
-    echo "ERROR: nothing selected"
-    exit 1
+    finalize_err "ERROR: nothing selected"
   fi
 fi
 
@@ -82,22 +153,37 @@ orig_disabled=0
 [ "$file" != "$enabled" ] && orig_disabled=1
 file_now="$file"
 
+if [ "$orig_disabled" = 1 ]; then
+  warn "$1 is currently disabled ($file)"
+else
+  info "$1 is currently enabled ($file)"
+fi
+
 managed=""
 pkg=""
 fp_scope=""
 
+info "checking whether $1 is managed by flatpak..."
 if command -v flatpak >/dev/null 2>&1; then
   base="$(basename "$enabled" .desktop)"
   if flatpak info --user "$base" >/dev/null 2>&1; then
     managed="flatpak"; pkg="$base"; fp_scope="user"
+    ok "managed by flatpak (user): $pkg"
   elif flatpak info --system "$base" >/dev/null 2>&1; then
     managed="flatpak"; pkg="$base"; fp_scope="system"
+    ok "managed by flatpak (system): $pkg"
+  else
+    step "not a flatpak app"
   fi
+else
+  step "flatpak not installed, skipping"
 fi
 
 if [ -z "$managed" ] && command -v pacman >/dev/null 2>&1 && [[ "$enabled" != "$HOME"/.local/* ]]; then
+  info "checking whether $1 is managed by pacman..."
   peeked=0
   if [ "$file_now" != "$enabled" ]; then
+    step "temporarily re-enabling to check package ownership..."
     sudowrap "$file_now" mv "$file_now" "$enabled"
     file_now="$enabled"
     peeked=1
@@ -105,21 +191,30 @@ if [ -z "$managed" ] && command -v pacman >/dev/null 2>&1 && [[ "$enabled" != "$
   pkg="$(pacman -Qoq "$enabled" 2>/dev/null)"
   if [ -n "$pkg" ]; then
     managed="pacman"
-  elif [ "$peeked" = 1 ]; then
-    sudowrap "$file_now" mv "$file_now" "$file"
-    file_now="$file"
+    ok "managed by pacman: $pkg"
+  else
+    step "not owned by any pacman package"
+    if [ "$peeked" = 1 ]; then
+      sudowrap "$file_now" mv "$file_now" "$file"
+      file_now="$file"
+    fi
   fi
 fi
 
+if [ -z "$managed" ]; then
+  warn "$1 isn't managed by pacman or flatpak — only enable/disable is available"
+fi
+
+clear_to_box
 if [ "$orig_disabled" = 1 ]; then
   if [ -n "$managed" ]; then
-    type="$(gum choose Enable 'Enable and Uninstall' Update)"
+    type="$(choose "What do you want to do with $1?" Enable 'Enable and Uninstall' Update)"
   else
     type="Enable"
   fi
 else
   if [ -n "$managed" ]; then
-    type="$(gum choose Disable Uninstall)"
+    type="$(choose "What do you want to do with $1?" Disable Uninstall)"
   else
     type="Disable"
   fi
@@ -129,73 +224,59 @@ if [ "$type" = "nothing selected" ] || [ -z "$type" ]; then
   if [ "$file_now" != "$file" ]; then
     sudowrap "$file_now" mv "$file_now" "$file"
   fi
-  lines=$((lines + 1))
-  printf '\033[%dF\033[0J' "$lines"
-  echo "ERROR: nothing selected"
-  exit 1
+  finalize_err "ERROR: nothing selected"
 elif [ "$type" = Disable ]; then
+  info "disabling $1..."
   sudowrap "$file_now" mv "$file_now" "$file.disabled"
   refresh_cache
-  printf '\033[%dF\033[0J' "$lines"
-  echo "disabled $1!"
-  exit 0
+  finalize_ok "disabled $1!"
 elif [ "$type" = Enable ]; then
+  info "enabling $1..."
   if [ "$file_now" != "$enabled" ]; then
     sudowrap "$file_now" mv "$file_now" "$enabled"
   fi
   refresh_cache
-  printf '\033[%dF\033[0J' "$lines"
-  echo "enabled $1!"
-  exit 0
+  finalize_ok "enabled $1!"
 elif [ "$type" = Uninstall ]; then
-  echo "uninstalling $1..."
+  info "uninstalling $1 (package: $pkg, via $managed)..."
   do_uninstall
   status=$?
   refresh_cache
-  lines=$((lines + 1))
-  printf '\033[%dF\033[0J' "$lines"
   if [ "$status" -eq 0 ]; then
-    echo "uninstalled $1!"
+    finalize_ok "uninstalled $1!"
   else
-    echo "ERROR: failed to uninstall $1"
-    exit 1
+    finalize_err "ERROR: failed to uninstall $1"
   fi
-  exit 0
 elif [ "$type" = Update ]; then
   if [ "$file_now" != "$enabled" ]; then
+    step "temporarily enabling $1 to apply the update..."
     sudowrap "$file_now" mv "$file_now" "$enabled"
     file_now="$enabled"
   fi
-  echo "updating $1..."
+  info "updating $1 (package: $pkg, via $managed)..."
   do_update
   status=$?
+  step "restoring disabled state..."
   sudowrap "$file_now" mv "$file_now" "$file"
   refresh_cache
-  lines=$((lines + 1))
-  printf '\033[%dF\033[0J' "$lines"
   if [ "$status" -eq 0 ]; then
-    echo "updated $1!"
+    finalize_ok "updated $1!"
   else
-    echo "ERROR: failed to update $1"
-    exit 1
+    finalize_err "ERROR: failed to update $1"
   fi
-  exit 0
 elif [ "$type" = 'Enable and Uninstall' ]; then
   if [ "$file_now" != "$enabled" ]; then
+    step "temporarily enabling $1 to uninstall cleanly..."
     sudowrap "$file_now" mv "$file_now" "$enabled"
     file_now="$enabled"
   fi
-  echo "uninstalling $1..."
+  info "uninstalling $1 (package: $pkg, via $managed)..."
   do_uninstall
   status=$?
   refresh_cache
-  lines=$((lines + 1))
-  printf '\033[%dF\033[0J' "$lines"
   if [ "$status" -eq 0 ]; then
-    echo "uninstalled $1!"
+    finalize_ok "uninstalled $1!"
   else
-    echo "ERROR: failed to uninstall $1"
-    exit 1
+    finalize_err "ERROR: failed to uninstall $1"
   fi
-  exit 0
 fi
