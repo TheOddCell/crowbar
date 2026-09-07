@@ -66,7 +66,7 @@ choose() {
 }
 
 find_app() {
-  for f in /usr/share/applications/*.desktop* ~/.local/share/applications/*.desktop* /var/lib/flatpak/exports/share/applications/*.desktop* ~/.local/share/flatpak/exports/share/applications/*.desktop*; do
+  for f in /usr/share/applications/*.desktop* ~/.local/share/applications/*.desktop* /var/lib/flatpak/exports/share/applications/*.desktop* ~/.local/share/flatpak/exports/share/applications/*.desktop* /var/lib/snapd/desktop/applications/*.desktop*; do
     name=$(grep -m1 '^Name=' "$f" | cut -d= -f2-)
     printf '%s\t%s\n' "$name" "$f"
   done | fzf --filter="$1" --nth=1 --with-nth=1,2 -d '\t' | cut -f2
@@ -98,6 +98,10 @@ check_deps() {
 do_uninstall() {
   case "$managed" in
     pacman) sudo pacman -Rns "$pkg" --noconfirm >/dev/null 2>&1 ;;
+    apt) sudo apt-get purge -y "$pkg" >/dev/null 2>&1 ;;
+    dnf) sudo dnf remove -y "$pkg" >/dev/null 2>&1 ;;
+    zypper) sudo zypper --non-interactive remove "$pkg" >/dev/null 2>&1 ;;
+    snap) sudo snap remove "$pkg" >/dev/null 2>&1 ;;
     flatpak)
       if [ "$fp_scope" = system ]; then
         sudo flatpak uninstall --system -y "$pkg" >/dev/null 2>&1
@@ -109,6 +113,10 @@ do_uninstall() {
 do_update() {
   case "$managed" in
     pacman) sudo pacman -S --needed "$pkg" --noconfirm >/dev/null 2>&1 ;;
+    apt) sudo apt-get install --only-upgrade -y "$pkg" >/dev/null 2>&1 ;;
+    dnf) sudo dnf install -y "$pkg" >/dev/null 2>&1 ;;
+    zypper) sudo zypper --non-interactive install "$pkg" >/dev/null 2>&1 ;;
+    snap) sudo snap refresh "$pkg" >/dev/null 2>&1 ;;
     flatpak)
       if [ "$fp_scope" = system ]; then
         sudo flatpak update --system -y "$pkg" >/dev/null 2>&1
@@ -179,8 +187,25 @@ else
   step "flatpak not installed, skipping"
 fi
 
-if [ -z "$managed" ] && command -v pacman >/dev/null 2>&1 && [[ "$enabled" != "$HOME"/.local/* ]]; then
-  info "checking whether $1 is managed by pacman..."
+if [ -z "$managed" ] && command -v snap >/dev/null 2>&1; then
+  case "$enabled" in
+    /var/lib/snapd/desktop/applications/*)
+      info "checking whether $1 is managed by snap..."
+      snap_name="$(basename "$enabled" .desktop)"
+      snap_name="${snap_name%%_*}"
+      if snap list "$snap_name" >/dev/null 2>&1; then
+        managed="snap"; pkg="$snap_name"
+        ok "managed by snap: $pkg"
+      else
+        step "not a snap app"
+      fi
+      ;;
+  esac
+fi
+
+if [ -z "$managed" ] && [[ "$enabled" != "$HOME"/.local/* ]] \
+  && { command -v pacman >/dev/null 2>&1 || command -v dpkg >/dev/null 2>&1 || command -v rpm >/dev/null 2>&1; }; then
+  info "checking whether $1 is managed by a system package..."
   peeked=0
   if [ "$file_now" != "$enabled" ]; then
     step "temporarily re-enabling to check package ownership..."
@@ -188,12 +213,17 @@ if [ -z "$managed" ] && command -v pacman >/dev/null 2>&1 && [[ "$enabled" != "$
     file_now="$enabled"
     peeked=1
   fi
-  pkg="$(pacman -Qoq "$enabled" 2>/dev/null)"
-  if [ -n "$pkg" ]; then
+  if command -v pacman >/dev/null 2>&1 && pkg="$(pacman -Qoq "$enabled" 2>/dev/null)" && [ -n "$pkg" ]; then
     managed="pacman"
     ok "managed by pacman: $pkg"
+  elif command -v dpkg >/dev/null 2>&1 && pkg="$(dpkg -S "$enabled" 2>/dev/null | head -1 | cut -d: -f1 | cut -d, -f1 | xargs)" && [ -n "$pkg" ]; then
+    managed="apt"
+    ok "managed by apt: $pkg"
+  elif command -v rpm >/dev/null 2>&1 && pkg="$(rpm -qf --qf '%{NAME}\n' "$enabled" 2>/dev/null | head -1)" && [ -n "$pkg" ]; then
+    if command -v dnf >/dev/null 2>&1; then managed="dnf"; else managed="zypper"; fi
+    ok "managed by $managed: $pkg"
   else
-    step "not owned by any pacman package"
+    step "not owned by any system package"
     if [ "$peeked" = 1 ]; then
       sudowrap "$file_now" mv "$file_now" "$file"
       file_now="$file"
@@ -202,7 +232,7 @@ if [ -z "$managed" ] && command -v pacman >/dev/null 2>&1 && [[ "$enabled" != "$
 fi
 
 if [ -z "$managed" ]; then
-  warn "$1 isn't managed by pacman or flatpak — only enable/disable is available"
+  warn "$1 isn't managed by any known package manager — only enable/disable is available"
 fi
 
 clear_to_box
